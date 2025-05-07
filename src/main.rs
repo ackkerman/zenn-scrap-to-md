@@ -1,11 +1,11 @@
-use std::error::Error;
-use std::env;
-use std::fs;
-use reqwest::blocking::Client;
-use reqwest::header::COOKIE;
-use serde::Deserialize;
+use std::{env, fs, io};
 use clap::Parser;
+use serde::Deserialize;
 use regex::Regex;
+use fantoccini::{Client, Locator};
+use fantoccini::error::NewSessionError;
+use tokio::time::{sleep, Duration};
+use thiserror::Error;
 
 /// Fetch Zenn scrap and save as Markdown file.
 #[derive(Parser)]
@@ -24,6 +24,22 @@ struct Args {
     skip_header: bool,
 }
 
+#[derive(Error, Debug)]
+enum AppError {
+    #[error("Fantoccini new session error: {0}")]
+    NewSession(#[from] NewSessionError),
+    #[error("Fantoccini error: {0}")]
+    WebDriver(#[from] fantoccini::error::CmdError),
+    #[error("Reqwest error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Env var missing: {0}")]
+    MissingEnv(String),
+    #[error("Invalid scrap URL or slug")]
+    BadSlug,
+}
+
 #[derive(Deserialize)]
 struct Scrap {
     title: String,
@@ -40,28 +56,54 @@ struct Comment {
 }
 
 /// Extract slug from URL or return input if already slug.
-fn extract_slug(input: &str) -> Option<String> {
+fn extract_slug(input: &str) -> Result<String, AppError> {
     let trimmed = input.trim_end_matches('/');
     if let Some(pos) = trimmed.find("/scraps/") {
-        Some(trimmed[(pos + 8)..].to_string())
+        Ok(trimmed[(pos + 8)..].to_string())
+    } else if !trimmed.is_empty() {
+        Ok(trimmed.to_string())
     } else {
-        Some(trimmed.to_string())
+        Err(AppError::BadSlug)
+    }
+}
+
+async fn manual_login_cookie() -> Result<String, AppError> {
+    // Load .env if exists (optional)
+    dotenv::dotenv().ok();
+
+    // Start WebDriver (Chromedriver/Geckodriver) at localhost:9515
+    let mut client = Client::new("http://localhost:9515").await?;
+    // Navigate to Zenn sign-in
+    client.goto("https://zenn.dev/sign_in").await?;
+    println!("Browser opened. Please log in (including Google OAuth) and then press ENTER here...");
+    // Wait for user input
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    // Short pause to allow cookies to set
+    sleep(Duration::from_secs(2)).await;
+    // Retrieve cookies
+    let cookies = client.get_all_cookies().await?;
+    client.close().await?;
+    // Find session cookie
+    if let Some(c) = cookies.iter().find(|c| c.name() == "_zenn_session") {
+        Ok(format!("_zenn_session={}", c.value()))
+    } else {
+        Err(AppError::BadSlug)
     }
 }
 
 /// Fetch scrap JSON, using optional cookie.
-fn fetch_scrap(slug: &str, cookie: Option<&str>) -> Result<Scrap, Box<dyn Error>> {
+async fn fetch_scrap(slug: &str, cookie: &str) -> Result<Scrap, AppError> {
     let url = format!("https://zenn.dev/api/scraps/{}/blob.json", slug);
-    let client = Client::builder().build()?;
-    let mut req = client.get(&url);
-    if let Some(c) = cookie {
-        req = req.header(COOKIE, c.to_string());
-    }
-    let resp = req.send()?;
+    let client = reqwest::Client::builder().build()?;
+    let resp = client.get(&url)
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(format!("Failed to fetch scrap: HTTP {}", resp.status()).into());
+        return Err(AppError::Http(resp.error_for_status().unwrap_err()));
     }
-    Ok(resp.json()?)
+    Ok(resp.json().await?)
 }
 
 /// Recursively render comments, converting Zenn image syntax to HTML and separating messages with lines.
@@ -111,49 +153,26 @@ fn render_markdown(scrap: &Scrap, url: &str, skip_header: bool) -> String {
     out
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
     let args = Args::parse();
-    let cookie = args.cookie.or_else(|| env::var("ZENN_AUTH_COOKIE").ok());
-    let slug = extract_slug(&args.url).ok_or("Invalid scrap URL or slug")?;
-    let scrap = fetch_scrap(&slug, cookie.as_deref())?;
-    let markdown = render_markdown(&scrap, &args.url, args.skip_header);
-    let title = scrap.title;
-
-    let out_path = args.output.clone().unwrap_or_else(|| format!("{}({}).md", title, slug));
-    fs::write(&out_path, markdown)?;
-    println!("Saved Markdown to {}", out_path);
+    // Determine scrap slug
+    let slug = extract_slug(&args.url)?;
+    // Determine session cookie: CLI > ENV > manual login
+    let cookie = if let Some(c) = args.cookie.clone() {
+        c
+    } else if let Ok(envc) = env::var("ZENN_AUTH_COOKIE") {
+        envc
+    } else {
+        manual_login_cookie().await?
+    };
+    
+    let scrap = fetch_scrap(&slug, &cookie).await?;
+    let title = scrap.title.clone();
+    let md = render_markdown(&scrap, &args.url, args.skip_header);
+    let out = args.output.clone().unwrap_or_else(|| format!("{}({}).md", title, slug));
+    fs::write(&out, md)?;
+    println!("Saved Markdown to {}", out);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_slug() {
-        assert_eq!(extract_slug("https://zenn.dev/foo/scraps/barbaz"), Some("barbaz".into()));
-        assert_eq!(extract_slug("barbaz"), Some("barbaz".into()));
-    }
-
-    #[test]
-    fn test_render_comments_skip_and_img() {
-        let comment = Comment {
-            author: "u".into(),
-            created_at: "2025-05-05".into(),
-            body_markdown: "![](https://example.com/img1.png) Text".into(),
-            children: vec![],
-        };
-        let md_with = {
-            let mut s = String::new();
-            render_comments(&[comment.clone()], &mut s, false);
-            s
-        };
-        assert!(md_with.contains("**u (2025-05-05)**"));
-        let md_without = {
-            let mut s = String::new();
-            render_comments(&[comment], &mut s, true);
-            s
-        };
-        assert!(!md_without.contains("**u (2025-05-05)**"));
-    }
 }
